@@ -1,0 +1,207 @@
+#utils.py
+import os
+import pickle
+def get_enrolled_employees(known_faces_dir):
+    """Get list of all enrolled employees with their metadata"""
+    employees = []
+    if not os.path.exists(known_faces_dir):
+        return employees
+    for emp_id in os.listdir(known_faces_dir):
+        emp_dir = os.path.join(known_faces_dir, emp_id)
+        if not os.path.isdir(emp_dir):
+            continue
+        metadata_path = os.path.join(emp_dir, 'metadata.pkl')
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'rb') as f:
+                    metadata = pickle.load(f)
+                employees.append(metadata)
+            except Exception as e:
+                print(f"Error loading metadata for {emp_id}: {e}")
+    return employees
+def validate_employee_id(employee_id, known_faces_dir):
+    """Check if an employee ID already exists"""
+    return os.path.exists(os.path.join(known_faces_dir, employee_id))
+# face_enroller.py
+import os
+import cv2
+import numpy as np
+from datetime import datetime
+import pickle
+from insightface.app import FaceAnalysis
+from typing import List, Union, Optional
+class FaceEnroller:
+    def __init__(self, known_faces_dir: str):
+        self.known_faces_dir = known_faces_dir
+        os.makedirs(known_faces_dir, exist_ok=True)
+        self.app = FaceAnalysis(name='antelopev2',
+                                providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        self.app.prepare(ctx_id=0, det_size=(416, 416))
+    def enroll_from_images(self, employee_id: str,
+                           employee_name: str,
+                           image_paths: Union[List[str], str],
+                           min_faces: int = 3,
+                           update_existing: bool = False) -> bool:
+        if not employee_id or not employee_name:
+            print("Error: Employee ID and name cannot be empty")
+            return False
+        if isinstance(image_paths, str) and os.path.isdir(image_paths):
+            image_paths = [
+                os.path.join(image_paths, f)
+                for f in os.listdir(image_paths)
+                if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+            ]
+        if not image_paths:
+            print("Error: No valid image files provided")
+            return False
+        emp_dir = os.path.join(self.known_faces_dir, employee_id)
+        enroll_dir = os.path.join(emp_dir, "enroll")
+        metadata_path = os.path.join(emp_dir, 'metadata.pkl')
+        if update_existing:
+            if not os.path.exists(emp_dir):
+                print(f"Error: Employee {employee_id} does not exist to update")
+                return False
+            print(f"\nUpdating {employee_name} ({employee_id}) with {len(image_paths)} images")
+        else:
+            if os.path.exists(emp_dir):
+                print(f"Error: Employee {employee_id} already exists (use update_existing=True)")
+                return False
+            os.makedirs(enroll_dir, exist_ok=True)
+            print(f"\nEnrolling {employee_name} ({employee_id}) from {len(image_paths)} images")
+        valid_count = 0
+        processed_images = []
+        for img_path in image_paths:
+            if not os.path.exists(img_path):
+                print(f"Warning: Image not found - {img_path}")
+                continue
+            try:
+                img = cv2.imread(img_path)
+                if img is None:
+                    print(f"Warning: Could not read image - {img_path}")
+                    continue
+                faces = self.app.get(img)
+                if len(faces) != 1:
+                    print(f"Warning: Found {len(faces)} faces in {img_path} (expected 1)")
+                    continue
+                face = faces[0]
+                if update_existing:
+                    existing_embeddings = [f for f in os.listdir(enroll_dir) if f.startswith("embedding_")]
+                    next_idx = len(existing_embeddings) + 1
+                else:
+                    next_idx = valid_count + 1
+                os.makedirs(enroll_dir, exist_ok=True)
+                embedding_filename = f"embedding_{next_idx}.npy"
+                embedding_path = os.path.join(enroll_dir, embedding_filename)
+                np.save(embedding_path, face.embedding)
+                face_filename = f"face_{next_idx}.jpg"
+                face_path = os.path.join(enroll_dir, face_filename)
+                cv2.imwrite(face_path, img)
+                valid_count += 1
+                processed_images.append(os.path.basename(img_path))
+                print(f"Processed {img_path} - Face {next_idx} detected")
+            except Exception as e:
+                print(f"Error processing {img_path}: {str(e)}")
+                continue
+        if update_existing:
+            if os.path.exists(metadata_path):
+                with open(metadata_path, "rb") as f:
+                    meta = pickle.load(f)
+                meta['embedding_count'] += valid_count
+                meta['source_images'].extend(processed_images)
+            else:
+                print("Warning: No existing metadata found for update")
+                meta = {
+                    'employee_id': employee_id,
+                    'employee_name': employee_name,
+                    'enrollment_date': datetime.now().isoformat(),
+                    'embedding_count': valid_count,
+                    'source_images': processed_images
+                }
+        else:
+            if valid_count >= min_faces:
+                meta = {
+                    'employee_id': employee_id,
+                    'employee_name': employee_name,
+                    'enrollment_date': datetime.now().isoformat(),
+                    'embedding_count': valid_count,
+                    'source_images': processed_images
+                }
+            else:
+                print(f"\nError: Only {valid_count} valid faces found (minimum {min_faces} required)")
+                if os.path.exists(enroll_dir) and valid_count == 0:
+                    for f in os.listdir(enroll_dir):
+                        os.remove(os.path.join(enroll_dir, f))
+                    os.rmdir(enroll_dir)
+                if os.path.exists(emp_dir) and not os.listdir(emp_dir):
+                    os.rmdir(emp_dir)
+                return False
+        with open(metadata_path, "wb") as f:
+            pickle.dump(meta, f)
+        action = "Updated" if update_existing else "Enrolled"
+        print(f"\nSuccess: {action} {employee_name} ({employee_id})")
+        print(f"Added {valid_count} new face embeddings (total: {meta['embedding_count']})")
+        return True
+    def run_interactive_enrollment(self):
+        print("\n=== Face Enrollment from Images ===")
+        employee_id = input("Enter employee ID: ").strip()
+        employee_name = input("Enter employee name: ").strip()
+        if not employee_id or not employee_name:
+            print("Error: Employee ID and name cannot be empty")
+            return
+        print("\nProvide image source:")
+        print("1. Directory containing images")
+        print("2. List of image file paths")
+        choice = input("Select option (1 or 2): ").strip()
+        if choice == "1":
+            dir_path = input("Enter directory path containing images: ").strip()
+            if not os.path.isdir(dir_path):
+                print("Error: Directory does not exist")
+                return
+            self.enroll_from_images(employee_id, employee_name, dir_path)
+        elif choice == "2":
+            file_paths = input("Enter image file paths (comma separated): ").strip()
+            file_list = [f.strip() for f in file_paths.split(',')]
+            self.enroll_from_images(employee_id, employee_name, file_list)
+        else:
+            print("Invalid choice")
+    def delete_employee(self, employee_id: str) -> bool:
+        emp_dir = os.path.join(self.known_faces_dir, employee_id)
+        if not os.path.exists(emp_dir):
+            return False
+        try:
+            for root, dirs, files in os.walk(emp_dir, topdown=False):
+                for f in files:
+                    os.unlink(os.path.join(root, f))
+                for d in dirs:
+                    os.rmdir(os.path.join(root, d))
+            os.rmdir(emp_dir)
+            return True
+        except Exception as e:
+            print(f"Error deleting employee {employee_id}: {e}")
+            return False
+    def delete_employee_image(self, employee_id: str, image_index: int) -> bool:
+        enroll_dir = os.path.join(self.known_faces_dir, employee_id, "enroll")
+        if not os.path.exists(enroll_dir):
+            return False
+        try:
+            face_file = f"face_{image_index}.jpg"
+            embedding_file = f"embedding_{image_index}.npy"
+            files_to_delete = [face_file, embedding_file]
+            deleted = False
+            for filename in files_to_delete:
+                file_path = os.path.join(enroll_dir, filename)
+                if os.path.exists(file_path):
+                    os.unlink(file_path)
+                    deleted = True
+            if deleted:
+                metadata_path = os.path.join(self.known_faces_dir, employee_id, 'metadata.pkl')
+                if os.path.exists(metadata_path):
+                    with open(metadata_path, "rb") as f:
+                        meta = pickle.load(f)
+                    meta['embedding_count'] = max(0, meta.get('embedding_count', 0) - 1)
+                    with open(metadata_path, "wb") as f:
+                        pickle.dump(meta, f)
+            return deleted
+        except Exception as e:
+            print(f"Error deleting image {image_index} for employee {employee_id}: {e}")
+            return False
